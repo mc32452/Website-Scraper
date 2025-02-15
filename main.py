@@ -1,3 +1,8 @@
+if not os.path.exists("/home/appuser/.cache/ms-playwright"):
+    os.system("playwright install chromium")
+
+st.write("Playwright is ready to use!")
+
 import streamlit as st
 st.set_page_config(layout="wide")
 import asyncio
