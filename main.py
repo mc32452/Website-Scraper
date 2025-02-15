@@ -2,12 +2,12 @@ import streamlit as st
 import asyncio
 import logging
 from urllib.parse import urlparse, urljoin
-from crawl4ai import AsyncWebCrawler
 from bs4 import BeautifulSoup
 import re
 import hashlib
-import os 
+import os
 
+# Ensure Playwright browsers are installed
 if not os.path.exists("/home/appuser/.cache/ms-playwright"):
     os.system("playwright install chromium")
 
@@ -18,13 +18,13 @@ try:
 except ImportError:
     Document = None
 
+# Crawl4AI imports based on documentation recommendations
+from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode, RateLimiter, CrawlerMonitor, DisplayMode
+from crawl4ai.async_dispatcher import MemoryAdaptiveDispatcher
+
 logging.basicConfig(level=logging.ERROR, format="%(asctime)s [%(levelname)s] %(message)s")
 
-visited_urls = set()
-visited_lock = asyncio.Lock()
-FIXED_DEPTH = 2
-seen_content_hashes = set()
-
+# Utility functions for content extraction
 def extract_main_content(html):
     if Document:
         try:
@@ -59,61 +59,30 @@ def extract_structured_data(url, html):
     content = clean_content(content)
     return {"url": url, "title": title, "content": content}
 
-async def iterative_scrape(start_url, max_pages, progress_callback=None):
-    queue = asyncio.Queue()
-    await queue.put((start_url, FIXED_DEPTH))
-    results = []
-    semaphore = asyncio.Semaphore(10)
-    allowed_domain = urlparse(start_url).netloc
+# Dispatcher and run configuration based on Crawl4AI docs (&#8203;:contentReference[oaicite:2]{index=2})
+def get_dispatcher():
+    rate_limiter = RateLimiter(
+        base_delay=(1.0, 3.0),  # randomized delay between requests
+        max_delay=60.0,         # cap for backoff delay
+        max_retries=3,          # retry limit
+        rate_limit_codes=[429, 503]
+    )
+    monitor = CrawlerMonitor(max_visible_rows=15, display_mode=DisplayMode.DETAILED)
+    dispatcher = MemoryAdaptiveDispatcher(
+        memory_threshold_percent=70.0,
+        check_interval=1.0,
+        max_session_permit=10,
+        rate_limiter=rate_limiter,
+        monitor=monitor
+    )
+    return dispatcher
 
-    async with AsyncWebCrawler() as crawler:
-        while not queue.empty():
-            if len(visited_urls) >= max_pages:
-                break
-            url, depth = await queue.get()
-            parsed = urlparse(url)
-            if parsed.scheme not in ("http", "https"):
-                queue.task_done()
-                continue
-            async with visited_lock:
-                if url in visited_urls:
-                    queue.task_done()
-                    continue
-                visited_urls.add(url)
-            try:
-                async with semaphore:
-                    result = await crawler.arun(url=url)
-                html = getattr(result, "html", "")
-                if html:
-                    data = extract_structured_data(url, html)
-                    content_hash = hashlib.md5(data.get("content").encode("utf-8")).hexdigest()
-                    if content_hash not in seen_content_hashes:
-                        seen_content_hashes.add(content_hash)
-                        results.append(data)
-                if progress_callback:
-                    progress_callback(len(visited_urls))
-                if depth > 0 and html:
-                    soup = BeautifulSoup(html, "html.parser")
-                    for a in soup.find_all("a", href=True):
-                        link = a["href"]
-                        full_link = urljoin(url, link)
-                        parsed_link = urlparse(full_link)
-                        if parsed_link.scheme in ("http", "https") and parsed_link.netloc == allowed_domain:
-                            await queue.put((full_link, depth - 1))
-            except asyncio.TimeoutError:
-                logging.error(f"Timeout error while scraping {url}. Retrying later.")
-                await queue.put((url, depth))
-            except Exception as e:
-                logging.error(f"Error scraping {url}: {e}")
-            finally:
-                queue.task_done()
-    return results
+run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
 
-async def scrape_sitemap(start_url, max_pages, progress_callback=None):
-    """Scrape the whole website by first fetching its sitemap.xml."""
+# --- Sitemap Mode ---
+async def crawl_from_sitemap(start_url: str, max_pages: int, progress_callback=None):
     sitemap_url = urljoin(start_url, "sitemap.xml")
     urls = []
-    # First, try to fetch the sitemap
     async with AsyncWebCrawler() as crawler:
         try:
             result = await crawler.arun(url=sitemap_url)
@@ -128,45 +97,74 @@ async def scrape_sitemap(start_url, max_pages, progress_callback=None):
         else:
             logging.error("No sitemap.xml found or sitemap is empty.")
             return []
-    # Limit to max_pages if provided
-    if max_pages and max_pages < len(urls):
-        urls = urls[:max_pages]
-    results = []
-    semaphore = asyncio.Semaphore(10)
+    # Limit URLs to max_pages if necessary
+    urls = urls[:max_pages] if max_pages < len(urls) else urls
+
+    dispatcher = get_dispatcher()
     async with AsyncWebCrawler() as crawler:
-        async def scrape_url(url):
-            try:
-                async with semaphore:
-                    result = await crawler.arun(url=url)
-                html = getattr(result, "html", "")
+        # Crawl all URLs concurrently using arun_many (batch processing)
+        results = await crawler.arun_many(urls=urls, config=run_config, dispatcher=dispatcher)
+        if progress_callback:
+            progress_callback(len(results))
+        return results
+
+# --- Iterative (Breadth-First) Mode ---
+async def iterative_crawl(start_url: str, max_pages: int, fixed_depth: int = 2, progress_callback=None):
+    seen_urls = {start_url}
+    current_level = [start_url]
+    all_results = []
+    dispatcher = get_dispatcher()
+
+    while current_level and fixed_depth >= 0 and len(seen_urls) < max_pages:
+        async with AsyncWebCrawler() as crawler:
+            # Crawl current level concurrently
+            results = await crawler.arun_many(urls=current_level, config=run_config, dispatcher=dispatcher)
+            all_results.extend(results)
+            if progress_callback:
+                progress_callback(len(all_results))
+            next_level = []
+            for res in results:
+                html = getattr(res, "html", "")
                 if html:
-                    data = extract_structured_data(url, html)
-                    content_hash = hashlib.md5(data.get("content").encode("utf-8")).hexdigest()
-                    if content_hash not in seen_content_hashes:
-                        seen_content_hashes.add(content_hash)
-                        results.append(data)
-                if progress_callback:
-                    progress_callback(len(results))
-            except Exception as e:
-                logging.error(f"Error scraping {url}: {e}")
-        tasks = [scrape_url(url) for url in urls]
-        await asyncio.gather(*tasks)
-    return results
+                    soup = BeautifulSoup(html, "html.parser")
+                    for a in soup.find_all("a", href=True):
+                        link = urljoin(res.url, a["href"])
+                        # Only consider links within the same domain
+                        if urlparse(link).netloc == urlparse(start_url).netloc and link not in seen_urls:
+                            seen_urls.add(link)
+                            next_level.append(link)
+                        if len(seen_urls) >= max_pages:
+                            break
+            current_level = next_level
+        fixed_depth -= 1
+    return all_results
 
 def aggregate_structured_data(scrape_results):
-    return "\n\n".join(
-        f"Title: {data.get('title')}\nContent: {data.get('content')}"
-        for data in scrape_results
-    )
+    # Map crawl4ai results to structured data and aggregate
+    texts = []
+    for res in scrape_results:
+        html = getattr(res, "html", "")
+        if html:
+            data = extract_structured_data(res.url, html)
+            texts.append(f"Title: {data.get('title')}\nURL: {data.get('url')}\nContent: {data.get('content')}")
+    return "\n\n".join(texts)
 
+# --- Streamlit UI ---
 if "scrape_results" not in st.session_state:
     st.session_state.scrape_results = None
 
-st.title("Website Scraper")
+st.title("Advanced Website Scraper")
+
 url_input = st.text_input("Enter the URL to scrape", "")
-max_pages = st.number_input("Max Pages to Scrape", min_value=1, value=1, step=1)
-# Checkbox for full-site scrape (default off)
-scrape_entire_site = st.checkbox("Scrape entire website (via sitemap.xml)", value=False)
+max_pages = st.number_input("Max Pages to Scrape", min_value=1, value=10, step=1)
+
+# Checkbox to select scraping mode
+scrape_entire_site = st.checkbox("Scrape entire website via sitemap.xml", value=False)
+
+progress_text = st.empty()
+
+def update_progress(count):
+    progress_text.text(f"Pages processed so far: {count}")
 
 if st.button("Scrape Website"):
     if not url_input:
@@ -178,19 +176,14 @@ if st.button("Scrape Website"):
         if parsed_input.scheme not in ("http", "https"):
             st.error("Please enter a valid URL (must start with http:// or https://).")
         else:
-            # Clear previous state
-            visited_urls.clear()
-            seen_content_hashes.clear()
             st.session_state.scrape_results = None
-            progress_text = st.empty()
-            def update_progress(count):
-                progress_text.text(f"Pages scraped so far: {count}")
+            # Run the appropriate mode using asyncio.run()
             if scrape_entire_site:
                 with st.spinner("Scraping entire website via sitemap.xml..."):
-                    scrape_results = asyncio.run(scrape_sitemap(url_input, max_pages, progress_callback=update_progress))
+                    scrape_results = asyncio.run(crawl_from_sitemap(url_input, max_pages, progress_callback=update_progress))
             else:
-                with st.spinner("Scraping in progress..."):
-                    scrape_results = asyncio.run(iterative_scrape(url_input, max_pages, progress_callback=update_progress))
+                with st.spinner("Iterative crawling in progress..."):
+                    scrape_results = asyncio.run(iterative_crawl(url_input, max_pages, fixed_depth=2, progress_callback=update_progress))
             st.session_state.scrape_results = scrape_results
             st.success(f"Scraped {len(scrape_results)} page(s).")
 
