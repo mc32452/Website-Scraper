@@ -6,6 +6,10 @@ from crawl4ai import AsyncWebCrawler
 from bs4 import BeautifulSoup
 import re
 import hashlib
+import os 
+
+if not os.path.exists("/home/appuser/.cache/ms-playwright"):
+    os.system("playwright install chromium")
 
 st.set_page_config(layout="wide")
 
