@@ -1,10 +1,4 @@
-if not os.path.exists("/home/appuser/.cache/ms-playwright"):
-    os.system("playwright install chromium")
-
-st.write("Playwright is ready to use!")
-
 import streamlit as st
-st.set_page_config(layout="wide")
 import asyncio
 import logging
 from urllib.parse import urlparse, urljoin
@@ -12,6 +6,8 @@ from crawl4ai import AsyncWebCrawler
 from bs4 import BeautifulSoup
 import re
 import hashlib
+
+st.set_page_config(layout="wide")
 
 try:
     from readability import Document
