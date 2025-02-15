@@ -8,9 +8,6 @@ from bs4 import BeautifulSoup
 import re
 import hashlib
 
-os.system('playwright install')
-os.system('playwright install-deps')
-
 try:
     from readability import Document
 except ImportError:
