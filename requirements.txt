@@ -1,6 +1,5 @@
 streamlit
+pandas
 crawl4ai
-beautifulsoup4
-readability-lxml
-playwright
-selenium
+pyvis
+
