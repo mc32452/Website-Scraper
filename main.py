@@ -6,6 +6,9 @@ import json
 from crawl4ai import AsyncWebCrawler
 from crawl4ai.async_configs import BrowserConfig, CrawlerRunConfig, CacheMode
 from pyvis.network import Network
+import os
+os.system("playwright install")
+
 
 st.set_page_config(layout="wide")
 st.title("Website Crawler and Scraper")
