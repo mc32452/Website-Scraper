@@ -1,155 +1,226 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import asyncio
-import logging
-from urllib.parse import urlparse, urljoin
+import pandas as pd
+import json
 from crawl4ai import AsyncWebCrawler
-from bs4 import BeautifulSoup
-import re
-import hashlib
-import os 
-
-if not os.path.exists("/home/appuser/.cache/ms-playwright"):
-    os.system("playwright install chromium")
+from crawl4ai.async_configs import BrowserConfig, CrawlerRunConfig, CacheMode
+from pyvis.network import Network
 
 st.set_page_config(layout="wide")
+st.title("Website Crawler and Scraper")
+st.write("An efficient, LLM-free approach to web crawling, data extraction, and site mapping.")
 
-try:
-    from readability import Document
-except ImportError:
-    Document = None
+def get_crawler_configs():
+    browser_config = BrowserConfig(verbose=True)
+    run_config = CrawlerRunConfig(
+        word_count_threshold=10,
+        excluded_tags=['form', 'header'],
+        exclude_external_links=True,
+        process_iframes=True,
+        remove_overlay_elements=True,
+        cache_mode=CacheMode.ENABLED
+    )
+    return browser_config, run_config
 
-logging.basicConfig(level=logging.ERROR, format="%(asctime)s [%(levelname)s] %(message)s")
+async def crawl_url(url: str):
+    browser_config, run_config = get_crawler_configs()
+    async with AsyncWebCrawler(config=browser_config) as crawler:
+        return await crawler.arun(url=url, config=run_config)
 
-visited_urls = set()
-visited_lock = asyncio.Lock()
-FIXED_DEPTH = 2
-seen_content_hashes = set()
-
-def extract_main_content(html):
-    if Document:
-        try:
-            doc = Document(html)
-            return doc.summary(html_partial=True)
-        except Exception as e:
-            logging.error(f"Readability extraction failed: {e}")
-    soup = BeautifulSoup(html, "html.parser")
-    article = soup.find("article")
-    if article:
-        return article.get_text(separator="\n", strip=True)
-    main = soup.find("main")
-    if main:
-        return main.get_text(separator="\n", strip=True)
-    return soup.get_text(separator="\n", strip=True)
-
-def clean_content(text):
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    seen = set()
-    deduped = []
-    for para in paragraphs:
-        if para not in seen:
-            seen.add(para)
-            deduped.append(para)
-    return "\n\n".join(deduped)
-
-def extract_structured_data(url, html):
-    soup = BeautifulSoup(html, "html.parser")
-    title = soup.title.get_text(strip=True) if soup.title else ""
-    content = extract_main_content(html)
-    content = re.sub(r'\s+', ' ', content).strip()
-    content = clean_content(content)
-    return {"url": url, "title": title, "content": content}
-
-async def iterative_scrape(start_url, max_pages, progress_callback=None):
-    queue = asyncio.Queue()
-    await queue.put((start_url, FIXED_DEPTH))
+async def crawl_all_links(links, max_concurrent=5):
     results = []
-    semaphore = asyncio.Semaphore(10)
-    allowed_domain = urlparse(start_url).netloc
-
-    async with AsyncWebCrawler() as crawler:
-        while not queue.empty():
-            if len(visited_urls) >= max_pages:
-                break
-            url, depth = await queue.get()
-            parsed = urlparse(url)
-            if parsed.scheme not in ("http", "https"):
-                queue.task_done()
-                continue
-            async with visited_lock:
-                if url in visited_urls:
-                    queue.task_done()
-                    continue
-                visited_urls.add(url)
-            try:
-                async with semaphore:
-                    result = await crawler.arun(url=url)
-                html = getattr(result, "html", "")
-                if html:
-                    data = extract_structured_data(url, html)
-                    content_hash = hashlib.md5(data.get("content").encode("utf-8")).hexdigest()
-                    if content_hash not in seen_content_hashes:
-                        seen_content_hashes.add(content_hash)
-                        results.append(data)
-                if progress_callback:
-                    progress_callback(len(visited_urls))
-                if depth > 0 and html:
-                    soup = BeautifulSoup(html, "html.parser")
-                    for a in soup.find_all("a", href=True):
-                        link = a["href"]
-                        full_link = urljoin(url, link)
-                        parsed_link = urlparse(full_link)
-                        if parsed_link.scheme in ("http", "https") and parsed_link.netloc == allowed_domain:
-                            await queue.put((full_link, depth - 1))
-            except asyncio.TimeoutError:
-                logging.error(f"Timeout error while scraping {url}. Retrying later.")
-                await queue.put((url, depth))
-            except Exception as e:
-                logging.error(f"Error scraping {url}: {e}")
-            finally:
-                queue.task_done()
+    browser_config, run_config = get_crawler_configs()
+    semaphore = asyncio.Semaphore(max_concurrent)
+    async with AsyncWebCrawler(config=browser_config) as crawler:
+        async def limited_crawl(link):
+            link_url = link.get("href")
+            if not link_url:
+                return {"URL": None, "Status": "Error", "Message": "Invalid URL", "Content": ""}
+            async with semaphore:
+                return await crawler.arun(url=link_url, config=run_config)
+        valid_links = [link for link in links if link.get("href")]
+        responses = await asyncio.gather(*(limited_crawl(link) for link in valid_links), return_exceptions=True)
+    for link, response in zip(valid_links, responses):
+        link_url = link.get("href")
+        if isinstance(response, Exception):
+            results.append({"URL": link_url, "Status": "Error", "Message": str(response), "Content": ""})
+        else:
+            if response.success:
+                results.append({
+                    "URL": link_url,
+                    "Status": "Success",
+                    "Message": f"Scraped {len(response.markdown)} chars",
+                    "Content": response.markdown
+                })
+            else:
+                results.append({
+                    "URL": link_url,
+                    "Status": "Failed",
+                    "Message": response.error_message,
+                    "Content": ""
+                })
     return results
 
-def aggregate_structured_data(scrape_results):
-    return "\n\n".join(
-        f"Title: {data.get('title')}\nContent: {data.get('content')}"
-        for data in scrape_results
-    )
+async def build_site_map(start_url, max_depth=2, max_concurrent=5):
+    visited = set([start_url])
+    nodes = {start_url: {"url": start_url}}
+    edges = []
+    current_level = [(start_url, 0)]
+    while current_level:
+        next_level = []
+        tasks = []
+        parent_data = []
+        for parent_url, depth in current_level:
+            if depth < max_depth:
+                tasks.append(crawl_url(parent_url))
+                parent_data.append((parent_url, depth))
+        if tasks:
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, response in enumerate(responses):
+                parent_url, parent_depth = parent_data[i]
+                if isinstance(response, Exception):
+                    continue
+                if response and response.success:
+                    internal_links = response.links.get("internal", [])
+                    for link in internal_links:
+                        child_url = link.get("href")
+                        # Only add URLs from the same domain (you can adjust this as needed)
+                        if child_url and child_url.startswith(start_url) and child_url not in visited:
+                            visited.add(child_url)
+                            nodes[child_url] = {"url": child_url}
+                            edges.append((parent_url, child_url))
+                            next_level.append((child_url, parent_depth + 1))
+        current_level = next_level
+    return list(nodes.keys()), edges
 
-if "scrape_results" not in st.session_state:
-    st.session_state.scrape_results = None
+tabs = st.tabs(["Scraping", "Site Map"])
 
-st.title("Website Scraper")
-url_input = st.text_input("Enter the URL to scrape", "")
-max_pages = st.number_input("Max Pages to Scrape", min_value=1, value=1, step=1)
-
-if st.button("Scrape Website"):
-    if not url_input:
-        st.error("Please enter a URL to scrape.")
-    else:
-        if not url_input.startswith("http://") and not url_input.startswith("https://"):
-            url_input = "https://" + url_input
-        parsed_input = urlparse(url_input)
-        if parsed_input.scheme not in ("http", "https"):
-            st.error("Please enter a valid URL (must start with http:// or https://).")
+with tabs[0]:
+    url_input = st.text_input("Enter URL", key="scraping_url")
+    if st.button("Crawl Website"):
+        url = url_input.strip()
+        if not url:
+            st.error("Please enter a valid URL.")
         else:
-            visited_urls.clear()
-            seen_content_hashes.clear()
-            st.session_state.scrape_results = None
-            progress_text = st.empty()
-            def update_progress(count):
-                progress_text.text(f"Pages scraped so far: {count}")
-            with st.spinner("Scraping in progress..."):
-                scrape_results = asyncio.run(iterative_scrape(url_input, max_pages, progress_callback=update_progress))
-            st.session_state.scrape_results = scrape_results
-            st.success(f"Scraped {len(scrape_results)} page(s).")
+            if not url.startswith("http"):
+                url = "https://" + url
+            st.info(f"Crawling **{url}** ...")
+            try:
+                main_result = asyncio.run(crawl_url(url))
+            except Exception as e:
+                st.error(f"An error occurred: {e}")
+                main_result = None
+            if main_result and main_result.success:
+                internal_links = main_result.links.get("internal", [])
+                if internal_links:
+                    st.session_state["internal_links"] = internal_links
+                    st.success("Crawl successful!")
+                else:
+                    st.warning("No internal links found.")
+            else:
+                error_msg = main_result.error_message if main_result else "No result returned."
+                st.error(f"Crawl failed: {error_msg}")
 
-if st.session_state.scrape_results:
-    aggregated_text = aggregate_structured_data(st.session_state.scrape_results)
-    domain = urlparse(url_input).netloc
-    file_name = f"scraped_{domain}.txt" if domain else "scraped_data.txt"
-    st.download_button(
-        label="Download as TXT",
-        data=aggregated_text,
-        file_name=file_name,
-        mime="text/plain",
-    )
+    if st.button("Scrape Single Link"):
+        url = url_input.strip()
+        if not url:
+            st.error("Please enter a valid URL.")
+        else:
+            if not url.startswith("http"):
+                url = "https://" + url
+            st.info(f"Scraping **{url}** ...")
+            try:
+                result = asyncio.run(crawl_url(url))
+            except Exception as e:
+                st.error(f"An error occurred: {e}")
+                result = None
+            if result and result.success:
+                json_data = json.dumps({"url": url, "content": result.markdown}, indent=2)
+                txt_data = result.markdown
+                st.success("Scrape successful!")
+                st.download_button(
+                    label="Download Scraped Content as JSON",
+                    data=json_data,
+                    file_name="scraped_content.json",
+                    mime="application/json"
+                )
+                st.download_button(
+                    label="Download Scraped Content as TXT (Markdown)",
+                    data=txt_data,
+                    file_name="scraped_content.txt",
+                    mime="text/plain"
+                )
+            else:
+                error_msg = result.error_message if result else "No result returned."
+                st.error(f"Scrape failed: {error_msg}")
+
+    if "internal_links" in st.session_state:
+        with st.expander("Internal Links Found"):
+            links_list = [link.get("href", "") for link in st.session_state["internal_links"] if link.get("href")]
+            df_links = pd.DataFrame(links_list, columns=["Links Found"])
+            st.table(df_links)
+        if st.button("Scrape All Links"):
+            st.info("Scraping all found links...")
+            try:
+                all_results = asyncio.run(crawl_all_links(st.session_state["internal_links"], max_concurrent=5))
+            except Exception as e:
+                st.error(f"An error occurred while scraping all links: {e}")
+                all_results = []
+            if all_results:
+                txt_content = ""
+                table_data = []
+                for result in all_results:
+                    link_url = result["URL"]
+                    status = result["Status"]
+                    message = result["Message"]
+                    content = result["Content"]
+                    table_data.append({"URL": link_url, "Status": status, "Message": message})
+                    txt_content += f"URL: {link_url}\n{content}\n\n{'-'*80}\n\n"
+                json_results = json.dumps(all_results, indent=2)
+                st.download_button(
+                    label="Download Scraped Content as JSON",
+                    data=json_results,
+                    file_name="scraped_content.json",
+                    mime="application/json"
+                )
+                st.download_button(
+                    label="Download Scraped Content as TXT (Markdown)",
+                    data=txt_content,
+                    file_name="scraped_content.txt",
+                    mime="text/plain"
+                )
+                st.markdown("### Scraping Results")
+                df_results = pd.DataFrame([row for row in table_data if row["Status"] == "Success"])
+                st.table(df_results)
+
+with tabs[1]:
+    st.header("Site Map Visualization")
+    site_url = st.text_input("Enter Site URL", key="sitemap_url")
+    max_depth = st.slider("Maximum Depth", min_value=1, max_value=5, value=2)
+    max_concurrent = st.slider("Max Concurrent Requests", min_value=1, max_value=10, value=5)
+    if st.button("Generate Site Map"):
+        site_url = site_url.strip()
+        if not site_url:
+            st.error("Please enter a valid URL.")
+        else:
+            if not site_url.startswith("http"):
+                site_url = "https://" + site_url
+            st.info(f"Generating site map for **{site_url}** ...")
+            try:
+                nodes, edges = asyncio.run(build_site_map(site_url, max_depth, max_concurrent))
+            except Exception as e:
+                st.error(f"Error during site map generation: {e}")
+                nodes, edges = [], []
+            if nodes:
+                net = Network(height="600px", width="100%", directed=True)
+                for node in nodes:
+                    color = "red" if node == site_url else "blue"
+                    net.add_node(node, label=node, color=color)
+                for parent, child in edges:
+                    net.add_edge(parent, child)
+                net.force_atlas_2based()  # Apply layout algorithm for a better visual
+                html = net.generate_html()
+                components.html(html, height=600, width=800, scrolling=True)
+            else:
+                st.warning("No nodes found for the site map.")
