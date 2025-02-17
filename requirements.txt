@@ -2,4 +2,5 @@ streamlit
 pandas
 crawl4ai
 pyvis
+playwright
 
